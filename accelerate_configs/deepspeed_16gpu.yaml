@@ -1,0 +1,41 @@
+compute_environment: LOCAL_MACHINE
+debug: false
+deepspeed_config:
+  deepspeed_multinode_launcher: standard
+  gradient_accumulation_steps: 1    # 16卡时无需累积
+  offload_optimizer_device: none    # H100 80G显存足够，不需要offload
+  offload_param_device: none        # H100 80G显存足够，不需要offload
+  zero3_init_flag: true             # 16卡时启用zero3初始化优化
+  zero_stage: 3                     # 16卡使用ZeRO-3获得更好的内存效率
+  # H100优化通信配置
+  communication_data_type: bf16     # H100支持native bf16
+  allgather_bucket_size: 500000000  # 更大的bucket size
+  reduce_bucket_size: 500000000     # 更大的bucket size
+  overlap_comm: true                # 启用通信重叠
+  contiguous_gradients: true        # 梯度连续存储
+  # ZeRO-3内存优化
+  stage3_max_live_parameters: 1e9
+  stage3_max_reuse_distance: 1e9
+  stage3_prefetch_bucket_size: 200000000
+  stage3_param_persistence_threshold: 1e5
+  stage3_gather_16bit_weights_on_model_save: true
+  # H100性能优化
+  round_robin_gradients: true       # 梯度轮询分布
+  elastic_checkpoint: false
+  # 大规模训练优化
+  sparse_gradients: false
+  cpu_offload: false
+  sub_group_size: 1e9
+distributed_type: DEEPSPEED
+downcast_bf16: 'no'
+machine_rank: 0
+main_training_function: main
+mixed_precision: bf16
+num_machines: 1
+num_processes: 16
+rdzv_backend: static
+same_network: true
+tpu_env: []
+tpu_use_cluster: false
+tpu_use_sudo: false
+use_cpu: false

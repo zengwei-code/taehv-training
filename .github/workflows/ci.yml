@@ -1,0 +1,152 @@
+name: CI
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: [3.8, 3.9, "3.10", "3.11"]
+
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Set up Python ${{ matrix.python-version }}
+      uses: actions/setup-python@v4
+      with:
+        python-version: ${{ matrix.python-version }}
+    
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install flake8 black isort mypy
+        if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+    
+    - name: Lint with flake8
+      run: |
+        # stop the build if there are Python syntax errors or undefined names
+        flake8 . --count --select=E9,F63,F7,F82 --show-source --statistics
+        # exit-zero treats all errors as warnings. The GitHub editor is 127 chars wide
+        flake8 . --count --exit-zero --max-complexity=10 --max-line-length=100 --statistics
+    
+    - name: Check code formatting with black
+      run: black --check --line-length 100 .
+    
+    - name: Check import sorting with isort
+      run: isort --check-only --profile black .
+    
+    - name: Type check with mypy
+      run: mypy . --ignore-missing-imports --no-strict-optional
+      continue-on-error: true  # Don't fail CI on type errors yet
+
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: [3.8, "3.10"]
+
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Set up Python ${{ matrix.python-version }}
+      uses: actions/setup-python@v4
+      with:
+        python-version: ${{ matrix.python-version }}
+    
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install pytest pytest-cov
+        if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+        # Install CPU-only PyTorch for testing
+        pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
+    
+    - name: Create test data
+      run: |
+        mkdir -p tests/data/videos
+        # Create dummy test files
+        touch tests/data/test_annotations.json
+        echo '{"total": 1, "list": [{"full_path": "tests/data/videos/test.mp4"}]}' > tests/data/test_annotations.json
+    
+    - name: Test with pytest
+      run: |
+        if [ -d tests ]; then
+          pytest tests/ -v --cov=training --cov=evaluation --cov-report=xml
+        else
+          echo "No tests directory found, skipping tests"
+        fi
+    
+    - name: Upload coverage to Codecov
+      uses: codecov/codecov-action@v3
+      with:
+        file: ./coverage.xml
+        flags: unittests
+        name: codecov-umbrella
+        fail_ci_if_error: false
+
+  docs:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.10'
+    
+    - name: Check documentation
+      run: |
+        # Check that README.md exists and is not empty
+        if [ ! -s README.md ]; then
+          echo "README.md is missing or empty"
+          exit 1
+        fi
+        
+        # Check that key documentation files exist
+        for file in CONTRIBUTING.md LICENSE CODE_OF_CONDUCT.md SECURITY.md; do
+          if [ ! -f "$file" ]; then
+            echo "$file is missing"
+            exit 1
+          fi
+        done
+        
+        # Check evaluation documentation
+        if [ ! -f evaluation/README.md ]; then
+          echo "evaluation/README.md is missing"
+          exit 1
+        fi
+        
+        if [ ! -f evaluation/TROUBLESHOOTING.md ]; then
+          echo "evaluation/TROUBLESHOOTING.md is missing"
+          exit 1
+        fi
+        
+        echo "All documentation files present"
+
+  security:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Run security checks
+      run: |
+        # Check for common security issues
+        
+        # Check that no private keys or credentials are committed
+        if grep -r "private_key\|secret_key\|password\|api_key" --include="*.py" --include="*.yml" --include="*.yaml" .; then
+          echo "Potential credentials found in code"
+          exit 1
+        fi
+        
+        # Check for TODO/FIXME comments that might indicate security issues
+        if grep -r "TODO.*security\|FIXME.*security\|HACK.*security" --include="*.py" .; then
+          echo "Security-related TODO/FIXME found"
+          # Don't fail, just warn
+        fi
+        
+        echo "Basic security checks passed"

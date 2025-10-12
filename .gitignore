@@ -1,0 +1,127 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual environments
+.env
+.venv
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+
+# IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# Temporary files
+*.log
+*.tmp
+*.temp
+
+# Jupyter Notebook
+.ipynb_checkpoints
+
+# PyTorch
+*.pth.tar
+
+# TensorBoard
+runs/
+
+# Model files (large files)
+*.pth
+*.bin
+*.safetensors
+*.ckpt
+*.pt
+
+# Allow specific small model files (if needed)
+# !checkpoints/small_model.pth
+
+# Training outputs
+output/
+logs/
+
+# Large data directories
+CogVideoX-2b/
+evaluation_results/
+evaluation/evaluation_results/
+
+# Data directories (potentially large)
+data/
+datasets/
+MiniDataset/
+
+# Checkpoints and model weights
+checkpoints/*.pth
+checkpoints/*.bin
+checkpoints/*.safetensors
+!checkpoints/.gitkeep
+
+# Training artifacts
+wandb/
+tensorboard_logs/
+mlruns/
+
+# Development tools
+.coverage
+htmlcov/
+.pytest_cache/
+.mypy_cache/
+.tox/
+bandit-report.json
+
+# Pre-commit
+.pre-commit-cache/
+
+# Temporary evaluation files
+*.png
+*.jpg
+*.jpeg
+*.mp4
+*.avi
+!docs/**/*.png
+!docs/**/*.jpg
+!evaluation/sample_*.png
+
+# System files
+*.pid
+*.seed
+*.pid.lock
+
+# Environment files
+.env.local
+.env.development
+.env.test
+.env.production
