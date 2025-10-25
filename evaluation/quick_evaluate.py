@@ -8,15 +8,18 @@ Quick Evaluation Script - Python Version
 3. 生成评估报告
 
 使用方法:
-    python quick_evaluate.py
-    python quick_evaluate.py --model_path output/xxx/final_model.pth --num_samples 200
+    python quick_evaluate.py --model_path xxx --data_root xxx --annotation_file xxx
 """
 
 import subprocess
 import argparse
 import json
+import os
 from pathlib import Path
 import sys
+
+# 修复GLIBCXX版本问题（matplotlib依赖）
+os.environ['LD_LIBRARY_PATH'] = '/data1/anaconda3/envs/tiny-vae/lib:' + os.environ.get('LD_LIBRARY_PATH', '')
 
 
 def print_header(text):
@@ -41,6 +44,90 @@ def print_error(text):
     print(f"❌ {text}")
 
 
+def detect_log_dir(project_root):
+    """自动检测日志目录"""
+    logs_dir = project_root / 'logs'
+    if not logs_dir.exists():
+        return None
+    
+    # 查找包含最多事件文件的日志目录
+    log_candidates = []
+    for subdir in logs_dir.iterdir():
+        if subdir.is_dir():
+            event_files = list(subdir.glob('events.out.tfevents.*'))
+            if event_files:
+                log_candidates.append((subdir, len(event_files)))
+    
+    if log_candidates:
+        # 返回包含最多事件文件的目录
+        log_candidates.sort(key=lambda x: x[1], reverse=True)
+        return str(log_candidates[0][0])
+    
+    return None
+
+
+def validate_paths(args, project_root):
+    """验证和修正路径参数"""
+    issues = []
+    suggestions = []
+    
+    # 检查模型路径
+    if not Path(args.model_path).exists():
+        issues.append(f"模型文件不存在: {args.model_path}")
+        
+        # 尝试在output目录中查找最新的模型
+        output_dir = project_root / 'output'
+        if output_dir.exists():
+            model_candidates = []
+            for subdir in sorted(output_dir.iterdir(), reverse=True):
+                if subdir.is_dir():
+                    best_model = subdir / 'best_model' / 'model.pth'
+                    final_model = subdir / 'final_model.pth'
+                    if best_model.exists():
+                        model_candidates.append(str(best_model))
+                        break
+                    elif final_model.exists():
+                        model_candidates.append(str(final_model))
+                        break
+            
+            if model_candidates:
+                suggestions.append(f"建议使用: --model_path {model_candidates[0]}")
+    
+    # 检查配置文件
+    if not Path(args.config).exists():
+        issues.append(f"配置文件不存在: {args.config}")
+        
+        # 尝试查找其他配置文件
+        config_dir = project_root / 'training' / 'configs'
+        if config_dir.exists():
+            config_files = list(config_dir.glob('taehv_config_*.py'))
+            if config_files:
+                suggestions.append(f"建议使用: --config {config_files[0]}")
+    
+    # 检查数据集路径（最重要）
+    if not args.data_root or not Path(args.data_root).exists():
+        issues.append("数据集根目录未指定或不存在")
+        suggestions.append("必须使用: --data_root /path/to/dataset")
+        suggestions.append("示例: --data_root /data/matrix-project/MiniDataset/data")
+    
+    if not args.annotation_file or not Path(args.annotation_file).exists():
+        issues.append("标注文件未指定或不存在")
+        suggestions.append("必须使用: --annotation_file /path/to/annotations.json")
+        suggestions.append("示例: --annotation_file /data/matrix-project/MiniDataset/stage1_annotations_500.json")
+    
+    # 检查日志目录（可选）
+    if args.log_dir and not Path(args.log_dir).exists():
+        detected_log = detect_log_dir(project_root)
+        if detected_log:
+            issues.append(f"指定的日志目录不存在: {args.log_dir}")
+            suggestions.append(f"检测到日志目录: --log_dir {detected_log}")
+            args.log_dir = detected_log  # 自动修正
+        else:
+            issues.append("未找到训练日志目录，将跳过日志分析")
+    
+    return issues, suggestions
+
+
 def run_command(cmd, description):
     """运行命令并处理错误"""
     print(f"\n⏳ {description}...")
@@ -60,7 +147,7 @@ def run_command(cmd, description):
         return False
 
 
-def analyze_training_logs(log_dir, output_dir):
+def analyze_training_logs(log_dir, output_dir, script_dir):
     """分析训练日志"""
     print_header("步骤1/3: 分析训练日志")
     
@@ -68,8 +155,11 @@ def analyze_training_logs(log_dir, output_dir):
         print_warning(f"日志目录不存在: {log_dir}，跳过")
         return False
     
+    # 使用绝对路径调用脚本
+    analyze_script = script_dir / "analyze_training_logs.py"
+    
     cmd = [
-        "python", "analyze_training_logs.py",
+        "python", str(analyze_script),
         "--log_dir", log_dir,
         "--output_dir", output_dir
     ]
@@ -85,7 +175,7 @@ def analyze_training_logs(log_dir, output_dir):
     return success
 
 
-def evaluate_model(model_path, config, num_samples, output_dir, data_root=None, annotation_file=None):
+def evaluate_model(model_path, config, num_samples, batch_size, output_dir, script_dir, data_root=None, annotation_file=None):
     """评估模型"""
     print_header("步骤2/3: 模型定量评估")
     
@@ -97,12 +187,15 @@ def evaluate_model(model_path, config, num_samples, output_dir, data_root=None, 
         print_error(f"配置文件不存在: {config}")
         return False
     
+    # 使用绝对路径调用脚本
+    evaluate_script = script_dir / "evaluate_vae.py"
+    
     cmd = [
-        "python", "evaluate_vae.py",
+        "python", str(evaluate_script),
         "--model_path", model_path,
         "--config", config,
         "--num_samples", str(num_samples),
-        "--batch_size", "4"
+        "--batch_size", str(batch_size)
     ]
     
     # 添加可选的数据集参数
@@ -303,71 +396,117 @@ def generate_markdown_report(eval_results, training_analysis, save_path, overall
 
 
 def main():
+    # 获取脚本所在目录的父目录（项目根目录）
+    script_dir = Path(__file__).parent  # evaluation/
+    project_root = script_dir.parent    # my_taehv_training/
+    
+    # 智能检测默认路径
+    detected_log_dir = detect_log_dir(project_root)
+    default_log_dir = detected_log_dir or str(project_root / 'logs')
+    
+    # 查找最新的模型
+    default_model = None
+    output_dir = project_root / 'output'
+    if output_dir.exists():
+        for subdir in sorted(output_dir.iterdir(), reverse=True):
+            if subdir.is_dir():
+                best_model = subdir / 'best_model' / 'model.pth'
+                if best_model.exists():
+                    default_model = str(best_model)
+                    break
+    
     parser = argparse.ArgumentParser(
         description='快速评估VAE模型 - 一键运行完整评估流程',
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
-示例:
-  python quick_evaluate.py
-  python quick_evaluate.py --model_path output/xxx/final_model.pth
-  python quick_evaluate.py --num_samples 200
+完整示例:
+  python evaluation/quick_evaluate.py \\
+      --model_path output/a800_2025-10-14_12-11-50/best_model/model.pth \\
+      --data_root /data/matrix-project/MiniDataset/data \\
+      --annotation_file /data/matrix-project/MiniDataset/stage1_annotations_500.json \\
+      --num_samples 100
+
+快速示例（自动检测模型）:
+  python evaluation/quick_evaluate.py \\
+      --data_root /data/matrix-project/MiniDataset/data \\
+      --annotation_file /data/matrix-project/MiniDataset/stage1_annotations_500.json
         """
     )
     
-    parser.add_argument(
+    # 必需参数组
+    required_group = parser.add_argument_group('必需参数（推荐明确指定）')
+    required_group.add_argument(
+        '--data_root',
+        type=str,
+        required=False,
+        help='⭐ 数据集根目录 [必需] - 示例: /data/matrix-project/MiniDataset/data'
+    )
+    
+    required_group.add_argument(
+        '--annotation_file',
+        type=str,
+        required=False,
+        help='⭐ 标注文件路径 [必需] - 示例: /data/matrix-project/MiniDataset/stage1_annotations_500.json'
+    )
+    
+    # 模型相关参数
+    model_group = parser.add_argument_group('模型相关参数')
+    model_group.add_argument(
         '--model_path',
         type=str,
-        default='../output/2025-10-01_19-59-50/final_model.pth',
-        help='模型checkpoint路径 (默认: ../output/2025-10-01_19-59-50/final_model.pth)'
+        default=default_model,
+        help=f'模型checkpoint路径 (默认: 自动检测最新模型)'
     )
     
-    parser.add_argument(
-        '--log_dir',
-        type=str,
-        default='../logs/taehv_h100_production',
-        help='训练日志目录 (默认: ../logs/taehv_h100_production)'
-    )
-    
-    parser.add_argument(
+    model_group.add_argument(
         '--config',
         type=str,
-        default='../training/configs/taehv_config_h100.py',
-        help='配置文件路径 (默认: ../training/configs/taehv_config_h100.py)'
+        default=str(project_root / 'training' / 'configs' / 'taehv_config_a800.py'),
+        help='配置文件路径 (默认: training/configs/taehv_config_a800.py)'
     )
     
-    parser.add_argument(
+    # 评估参数
+    eval_group = parser.add_argument_group('评估参数')
+    eval_group.add_argument(
         '--num_samples',
         type=int,
         default=100,
         help='评估样本数量 (默认: 100)'
     )
     
-    parser.add_argument(
-        '--output_dir',
-        type=str,
-        default='./evaluation_results',
-        help='结果输出目录 (默认: ./evaluation_results)'
+    eval_group.add_argument(
+        '--batch_size',
+        type=int,
+        default=4,
+        help='批次大小 (默认: 4)'
     )
     
-    parser.add_argument(
+    # 日志和输出
+    log_group = parser.add_argument_group('日志和输出')
+    log_group.add_argument(
+        '--log_dir',
+        type=str,
+        default=default_log_dir,
+        help=f'训练日志目录 (默认: {default_log_dir})'
+    )
+    
+    log_group.add_argument(
+        '--output_dir',
+        type=str,
+        default=str(script_dir / 'evaluation_results'),
+        help='结果输出目录 (默认: evaluation/evaluation_results)'
+    )
+    
+    log_group.add_argument(
         '--skip_logs',
         action='store_true',
         help='跳过训练日志分析'
     )
     
-    parser.add_argument(
-        '--data_root',
-        type=str,
-        help='覆盖配置文件中的数据集根目录'
-    )
-    
-    parser.add_argument(
-        '--annotation_file',
-        type=str,
-        help='覆盖配置文件中的annotation文件路径'
-    )
-    
     args = parser.parse_args()
+    
+    # 验证路径
+    issues, suggestions = validate_paths(args, project_root)
     
     # 打印配置
     print_header("🚀 快速评估 Tiny-VAE 模型")
@@ -375,23 +514,57 @@ def main():
     print(f"日志目录: {args.log_dir}")
     print(f"配置文件: {args.config}")
     print(f"评估样本数: {args.num_samples}")
+    print(f"批次大小: {args.batch_size}")
     print(f"结果目录: {args.output_dir}")
     if args.data_root:
-        print(f"数据集根目录: {args.data_root} (覆盖)")
+        print(f"数据集根目录: {args.data_root}")
     if args.annotation_file:
-        print(f"Annotation文件: {args.annotation_file} (覆盖)")
+        print(f"Annotation文件: {args.annotation_file}")
+    
+    # 显示问题和建议
+    if issues:
+        print("\n" + "="*60)
+        print("⚠️  发现以下问题:")
+        print("="*60)
+        for issue in issues:
+            print(f"  • {issue}")
+        
+        if suggestions:
+            print("\n💡 建议:")
+            for suggestion in suggestions:
+                print(f"  • {suggestion}")
+        
+        # 检查是否是致命错误（数据集路径）
+        if not args.data_root or not Path(args.data_root).exists() or \
+           not args.annotation_file or not Path(args.annotation_file).exists():
+            print("\n" + "="*60)
+            print_error("数据集路径是必需的，无法继续评估")
+            print("="*60)
+            print("\n请使用以下命令运行:")
+            print("  python evaluation/quick_evaluate.py \\")
+            print("      --data_root /data/matrix-project/MiniDataset/data \\")
+            print("      --annotation_file /data/matrix-project/MiniDataset/stage1_annotations_500.json \\")
+            if default_model:
+                print(f"      --model_path {default_model} \\")
+            print("      --num_samples 100")
+            print()
+            sys.exit(1)
+        
+        print("\n将尝试继续执行...")
+        print("="*60)
     
     # 创建输出目录
     Path(args.output_dir).mkdir(parents=True, exist_ok=True)
     
     # 步骤1: 分析训练日志
     if not args.skip_logs:
-        analyze_training_logs(args.log_dir, args.output_dir)
+        analyze_training_logs(args.log_dir, args.output_dir, script_dir)
     else:
         print_warning("跳过训练日志分析（--skip_logs）")
     
     # 步骤2: 评估模型
-    if not evaluate_model(args.model_path, args.config, args.num_samples, args.output_dir,
+    if not evaluate_model(args.model_path, args.config, args.num_samples, args.batch_size,
+                         args.output_dir, script_dir,
                          data_root=args.data_root, annotation_file=args.annotation_file):
         print_error("模型评估失败，终止")
         sys.exit(1)

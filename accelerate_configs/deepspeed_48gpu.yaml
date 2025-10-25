@@ -1,0 +1,69 @@
+compute_environment: LOCAL_MACHINE
+debug: false
+deepspeed_config:
+  deepspeed_multinode_launcher: standard
+  gradient_accumulation_steps: 1    # 48卡时无需累积
+  offload_optimizer_device: none    # H100 80G显存足够，不需要offload
+  offload_param_device: none        # H100 80G显存足够，不需要offload
+  zero3_init_flag: true             # 48卡启用zero3初始化优化
+  zero_stage: 3                     # 48卡使用ZeRO-3获得最佳内存分布
+  # H100优化通信配置 - 6机器训练优化
+  communication_data_type: bf16     # H100支持native bf16
+  allgather_bucket_size: 750000000  # 750MB - 48卡适中bucket size
+  reduce_bucket_size: 750000000     # 750MB - 48卡适中bucket size
+  overlap_comm: true                # 启用通信重叠
+  contiguous_gradients: true        # 梯度连续存储
+  # ZeRO-3内存优化 - 48卡优化
+  stage3_max_live_parameters: 8e8   # 48卡适中参数
+  stage3_max_reuse_distance: 8e8    # 48卡适中重用距离
+  stage3_prefetch_bucket_size: 250000000  # 250MB prefetch
+  stage3_param_persistence_threshold: 1e5
+  stage3_gather_16bit_weights_on_model_save: true
+  # H100性能优化
+  round_robin_gradients: true       # 梯度轮询分布 - 48卡重要
+  elastic_checkpoint: false
+  # 多机训练优化
+  sparse_gradients: false
+  cpu_offload: false
+  sub_group_size: 1e9
+  # 通信压缩（可选）
+  prescale_gradients: false
+  gradient_predivide_factor: 1.0
+  wall_clock_breakdown: false
+  dump_state: false
+  # FP16/BF16优化
+  fp16:
+    enabled: false
+  bf16:
+    enabled: true
+  # ZeRO优化器配置
+  zero_optimization:
+    stage: 3
+    overlap_comm: true
+    contiguous_gradients: true
+    reduce_bucket_size: 750000000
+    stage3_prefetch_bucket_size: 250000000
+    stage3_param_persistence_threshold: 100000
+    stage3_max_live_parameters: 800000000
+    stage3_max_reuse_distance: 800000000
+    stage3_gather_16bit_weights_on_model_save: true
+    round_robin_gradients: true
+distributed_type: DEEPSPEED
+downcast_bf16: 'no'
+machine_rank: 0                  # 由平台环境变量RANK自动设置
+main_training_function: main
+mixed_precision: bf16
+num_machines: 6                  # 6台机器
+num_processes: 48                # 总共48个进程 (6机器×8GPU)
+rdzv_backend: c10d               # 使用c10d后端支持多机训练
+same_network: true               # 云平台保证同一网络
+tpu_env: []
+tpu_use_cluster: false
+tpu_use_sudo: false
+use_cpu: false
+# 云平台会通过环境变量自动设置以下参数：
+# - MASTER_ADDR: 主节点地址
+# - MASTER_PORT: 主进程端口（默认29500）
+# - RANK: 当前节点编号（0-5）
+# - WORLD_SIZE: 总节点数（6）
+

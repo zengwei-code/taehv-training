@@ -36,6 +36,7 @@ show_usage() {
     echo "  1     - 单卡训练 (推荐用于快速测试)"
     echo "  8     - 8卡训练 (推荐用于H100生产)"
     echo "  16    - 16卡训练"
+    echo "  64    - 64卡训练 (8台机器×8 GPU，需要使用train_taehv_multinode.sh)"
     echo ""
     echo "配置类型:"
     echo "  test     - 测试配置 (MiniDataset)"
@@ -60,6 +61,10 @@ show_usage() {
     echo ""
     echo "  # 从检查点恢复"
     echo "  $0 8 h100 --resume output/checkpoint-5000"
+    echo ""
+    echo "  # 64卡多机训练（请使用专用脚本）"
+    echo "  ./train_taehv_multinode.sh --num-machines 8 --machine-rank 0 --main-process-ip 10.0.0.1"
+    echo "  详见: MULTINODE_TRAINING_GUIDE.md"
 }
 
 # 默认参数
@@ -98,9 +103,24 @@ while [[ $# -gt 0 ]]; do
 done
 
 # 验证GPU数量
-if ! [[ "$GPU_COUNT" =~ ^(1|8|16)$ ]]; then
+if ! [[ "$GPU_COUNT" =~ ^(1|8|16|64)$ ]]; then
     print_error "不支持的GPU数量: $GPU_COUNT"
-    print_info "支持的GPU数量: 1, 8, 16"
+    print_info "支持的GPU数量: 1, 8, 16, 64"
+    exit 1
+fi
+
+# 64卡需要使用多机训练脚本
+if [ "$GPU_COUNT" -eq 64 ]; then
+    print_error "64卡训练需要使用多机训练脚本: train_taehv_multinode.sh"
+    echo ""
+    print_info "使用方法:"
+    echo "  ./train_taehv_multinode.sh \\"
+    echo "    --num-machines 8 \\"
+    echo "    --machine-rank 0 \\"  # 主节点为0，其他节点为1-7
+    echo "    --main-process-ip 10.0.0.1 \\"
+    echo "    --num-gpus 8"
+    echo ""
+    print_info "详细说明请参考: MULTINODE_TRAINING_GUIDE.md"
     exit 1
 fi
 
@@ -115,6 +135,13 @@ case $CONFIG_TYPE in
         if [ "$GPU_COUNT" -eq 1 ]; then
             CONFIG_FILE="training/configs/taehv_config_1gpu_h100.py"
             print_info "使用单卡H100配置 (720×480×19帧)"
+        elif [ "$GPU_COUNT" -eq 16 ]; then
+            CONFIG_FILE="training/configs/taehv_config_16gpu_h100.py"
+            print_info "使用16卡H100生产配置 (ZeRO-3优化)"
+        elif [ "$GPU_COUNT" -eq 64 ]; then
+            # 这个分支不应该被执行到，因为前面已经检查并退出
+            print_error "64卡训练请使用 train_taehv_multinode.sh"
+            exit 1
         else
             CONFIG_FILE="training/configs/taehv_config_h100.py"
             print_info "使用${GPU_COUNT}卡H100生产配置"

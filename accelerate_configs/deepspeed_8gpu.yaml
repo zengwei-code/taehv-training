@@ -9,8 +9,8 @@ deepspeed_config:
   zero_stage: 2
   # H100/A800通用通信配置
   communication_data_type: bf16     # H100/A800都支持bf16
-  allgather_bucket_size: 200000000  # 适中的bucket size适配不同GPU
-  reduce_bucket_size: 200000000     # 适中的bucket size
+  allgather_bucket_size: 500000000  # 适中的bucket size适配不同GPU
+  reduce_bucket_size: 500000000     # 适中的bucket size
   overlap_comm: true                # 启用通信重叠
   contiguous_gradients: true        # 梯度连续存储
   # 内存优化（针对大显存）

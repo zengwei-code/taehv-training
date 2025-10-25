@@ -27,7 +27,7 @@ class RefVAE(nn.Module):
                 model_path, 
                 subfolder="vae", 
                 torch_dtype=dtype
-            )
+            ).to(device)  # 🔧 修复：将VAE移动到指定设备
             self.vae_type = "cogvideox"
             print(f"✓ Loaded CogVideoX VAE from {'local path' if cogvideox_model_path else 'HuggingFace Hub'}: {model_path}")
         except Exception as e:
@@ -38,7 +38,7 @@ class RefVAE(nn.Module):
                     "Wan-AI/Wan2.1-T2V-1.3B-Diffusers", 
                     subfolder="vae", 
                     torch_dtype=dtype
-                )
+                ).to(device)  # 🔧 修复：将VAE移动到指定设备
                 self.vae_type = "wan"
                 print("✓ Loaded Wan VAE")
             except Exception as e2:

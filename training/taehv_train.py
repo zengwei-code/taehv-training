@@ -5,6 +5,8 @@ TAEHV训练脚本
 """
 
 import argparse
+import datetime
+import json
 import logging
 import math
 import os
@@ -13,6 +15,8 @@ import sys
 import warnings
 from pathlib import Path
 from typing import Optional
+
+import numpy as np
 
 # 过滤不重要的警告
 warnings.filterwarnings("ignore", message=".*expandable_segments not supported.*")
@@ -71,6 +75,11 @@ from diffusers.utils import check_min_version, convert_state_dict_to_diffusers, 
 from tqdm.auto import tqdm
 import transformers
 
+# 验证相关库
+import lpips
+from skimage.metrics import peak_signal_noise_ratio as psnr
+from skimage.metrics import structural_similarity as ssim
+
 # 检查版本
 check_min_version("0.21.0")
 
@@ -79,7 +88,7 @@ sys.path.append(str(Path(__file__).parent.parent))
 
 from models.taehv import TAEHV
 from training.dataset import MiniDataset
-from training.utils import get_ref_vae
+from training.training_utils import get_ref_vae
 
 # 配置彩色日志
 logger = get_logger(__name__, log_level="INFO")
@@ -128,6 +137,147 @@ def parse_args():
 
     args = parser.parse_args()
     return args
+
+
+def compute_validation_metrics(
+    model,
+    val_dataloader,
+    device,
+    lpips_fn,
+    num_samples=20,
+    logger=None,
+    use_amp=True
+):
+    """
+    计算验证集上的评估指标
+    
+    Args:
+        model: TAEHV模型
+        val_dataloader: 验证数据加载器
+        device: 计算设备
+        lpips_fn: LPIPS损失函数
+        num_samples: 评估样本数
+        logger: 日志记录器
+        use_amp: 是否使用自动混合精度（修复bf16类型不匹配问题）
+    
+    Returns:
+        dict: {
+            'val/psnr': float,
+            'val/ssim': float,
+            'val/lpips': float,
+            'val/psnr_std': float,
+            'val/ssim_std': float,
+        }
+    """
+    if logger:
+        logger.info(f"Computing validation metrics on {num_samples} samples...")
+    
+    model.eval()
+    
+    psnr_list = []
+    ssim_list = []
+    lpips_list = []
+    
+    with torch.no_grad():
+        sample_count = 0
+        for batch in val_dataloader:
+            if sample_count >= num_samples:
+                break
+            
+            # 获取视频数据
+            if isinstance(batch, dict):
+                videos = batch['video'].to(device)
+            else:
+                videos = batch.to(device)
+            
+            # 确保输入在 [0, 1] 范围（TAEHV 要求）
+            if videos.min() < 0:
+                videos = (videos + 1) / 2  # [-1, 1] -> [0, 1]
+            
+            try:
+                # ✅ 使用自动混合精度包裹，解决bf16类型不匹配问题
+                with torch.amp.autocast('cuda', enabled=use_amp, dtype=torch.bfloat16):
+                    # 编码-解码
+                    latents = model.encode_video(videos, parallel=True, show_progress_bar=False)
+                    reconstructions = model.decode_video(latents, parallel=True, show_progress_bar=False)
+                
+                # ✅ 在autocast后，转换回float32（scikit-image不支持bfloat16）
+                reconstructions = reconstructions.float()
+                
+                # 对齐帧数（TAEHV会裁剪帧）
+                frames_to_trim = getattr(model, 'frames_to_trim', 0)
+                if reconstructions.shape[1] < videos.shape[1] and frames_to_trim > 0:
+                    # 裁剪原始视频，使其与重建视频的帧数匹配
+                    videos_trimmed = videos[:, frames_to_trim:frames_to_trim + reconstructions.shape[1]]
+                else:
+                    videos_trimmed = videos
+                
+                # 确保帧数匹配
+                if videos_trimmed.shape[1] != reconstructions.shape[1]:
+                    if logger:
+                        logger.warning(f"Frame mismatch: original {videos_trimmed.shape[1]} vs recon {reconstructions.shape[1]}, skipping batch")
+                    continue
+                
+                # 转换为numpy计算PSNR/SSIM（确保float32）
+                orig_np = videos_trimmed.cpu().float().numpy()
+                recon_np = reconstructions.cpu().numpy()
+                
+                # 逐帧计算PSNR和SSIM
+                batch_size, n_frames = orig_np.shape[0], orig_np.shape[1]
+                for b in range(batch_size):
+                    for t in range(n_frames):
+                        orig_frame = orig_np[b, t].transpose(1, 2, 0)  # CHW -> HWC
+                        recon_frame = recon_np[b, t].transpose(1, 2, 0)
+                        
+                        # PSNR
+                        psnr_val = psnr(orig_frame, recon_frame, data_range=1.0)
+                        psnr_list.append(psnr_val)
+                        
+                        # SSIM
+                        ssim_val = ssim(
+                            orig_frame, 
+                            recon_frame, 
+                            data_range=1.0, 
+                            channel_axis=2, 
+                            win_size=11
+                        )
+                        ssim_list.append(ssim_val)
+                
+                # 批量计算LPIPS（在GPU上更快）
+                if lpips_fn is not None:
+                    B, T, C, H, W = videos_trimmed.shape
+                    # 确保两个输入都是float32（LPIPS不支持bf16）
+                    orig_flat = videos_trimmed.float().reshape(B * T, C, H, W)
+                    recon_flat = reconstructions.float().reshape(B * T, C, H, W)
+                    
+                    # LPIPS必须在float32下计算，不使用autocast
+                    lpips_vals = lpips_fn(orig_flat, recon_flat)
+                    lpips_list.extend(lpips_vals.cpu().numpy().flatten().tolist())
+                
+                sample_count += batch_size
+                
+            except Exception as e:
+                if logger:
+                    logger.warning(f"Error processing batch: {e}, skipping")
+                continue
+    
+    model.train()
+    
+    # 计算统计信息
+    results = {
+        'val/psnr': float(np.mean(psnr_list)),
+        'val/ssim': float(np.mean(ssim_list)),
+        'val/psnr_std': float(np.std(psnr_list)),
+        'val/ssim_std': float(np.std(ssim_list)),
+    }
+    
+    if lpips_list:
+        results['val/lpips'] = float(np.mean(lpips_list))
+    
+    if logger:
+        logger.info(f"Validation completed: PSNR={results['val/psnr']:.2f}, SSIM={results['val/ssim']:.4f}")
+    
+    return results
 
 
 def main():
@@ -209,22 +359,61 @@ def main():
         augmentation=True
     )
 
-    train_dataloader = DataLoader(
-        train_dataset,
-        shuffle=True,
-        batch_size=config.train_batch_size,
-        num_workers=config.dataloader_num_workers,
-        pin_memory=config.pin_memory,
-        prefetch_factor=config.prefetch_factor,
-        drop_last=True,
+    # 构建DataLoader参数（处理单进程/多进程模式的兼容性）
+    train_dataloader_kwargs = {
+        'shuffle': True,
+        'batch_size': config.train_batch_size,
+        'num_workers': config.dataloader_num_workers,
+        'pin_memory': config.pin_memory,
+        'drop_last': True,
+    }
+    
+    # prefetch_factor 仅在多进程模式下有效
+    if config.dataloader_num_workers > 0 and hasattr(config, 'prefetch_factor'):
+        train_dataloader_kwargs['prefetch_factor'] = config.prefetch_factor
+    
+    train_dataloader = DataLoader(train_dataset, **train_dataloader_kwargs)
+
+    # 创建验证数据集（使用相同配置但不做增强）
+    logger.info("Creating validation dataset...")
+    val_dataset = MiniDataset(
+        annotation_file=config.annotation_file,
+        data_dir=config.data_root,
+        patch_hw=config.height,
+        n_frames=config.n_frames,
+        min_frame_delta=config.min_frame_delta,
+        max_frame_delta=config.max_frame_delta,
+        augmentation=False,  # 验证时不做数据增强
+        cache_videos=False
     )
+    
+    # 限制验证集大小（避免过慢）
+    if len(val_dataset.annotations) > 100:
+        val_dataset.annotations = val_dataset.annotations[:100]
+        logger.info(f"Limited validation dataset to 100 samples")
+    else:
+        logger.info(f"Validation dataset has {len(val_dataset.annotations)} samples")
+    
+    # 验证DataLoader与训练保持一致的模式（单进程/多进程）
+    val_num_workers = 0 if config.dataloader_num_workers == 0 else min(2, config.dataloader_num_workers)
+    val_dataloader = DataLoader(
+        val_dataset,
+        shuffle=False,  # 验证不需要shuffle
+        batch_size=config.validation_batch_size,
+        num_workers=val_num_workers,  # 与训练配置一致
+        pin_memory=True,
+        drop_last=False  # 验证不需要drop_last
+    )
+    logger.info(f"✅ Validation dataloader created (num_workers={val_num_workers})")
 
     # 准备学习率调度器
     lr_scheduler = get_scheduler(
         config.lr_scheduler,
         optimizer=optimizer,
-        num_warmup_steps=config.lr_warmup_steps * accelerator.num_processes,
-        num_training_steps=config.max_train_steps * accelerator.num_processes,
+        # num_warmup_steps=config.lr_warmup_steps * accelerator.num_processes,
+        # num_training_steps=config.max_train_steps * accelerator.num_processes,
+        num_warmup_steps=config.lr_warmup_steps,
+        num_training_steps=config.max_train_steps,
         num_cycles=config.lr_num_cycles,
     )
 
@@ -275,6 +464,29 @@ def main():
     if seraena is not None:
         # Seraena不需要训练，手动移动到设备而不是通过DeepSpeed准备
         seraena = seraena.to(accelerator.device)
+
+    # 初始化LPIPS感知损失（只在主进程）
+    lpips_fn = None
+    if accelerator.is_main_process:
+        logger.info("Initializing LPIPS metric for validation...")
+        lpips_fn = lpips.LPIPS(net='alex').to(accelerator.device)
+        lpips_fn.eval()  # 设置为eval模式
+        logger.info("✅ LPIPS initialized")
+
+    # 初始化最佳模型跟踪变量
+    best_val_psnr = 0.0
+    best_val_step = 0
+    patience_counter = 0
+    patience_limit = getattr(config, 'early_stopping_patience', 5)  # 默认5次验证无改善则停止
+
+    # 验证历史记录
+    validation_history = {
+        'steps': [],
+        'psnr': [],
+        'ssim': [],
+        'lpips': []
+    }
+    logger.info(f"Early stopping patience: {patience_limit} validations")
 
     # 计算总训练步数
     num_update_steps_per_epoch = math.ceil(
@@ -361,15 +573,29 @@ def main():
         disable=not accelerator.is_local_main_process,
     )
 
+    # 确保所有进程的模型都处于训练模式
+    model.train()
+    
+    # 同步所有进程
+    accelerator.wait_for_everyone()
+    
+    # 提示GPU内存监控已启用
+    if accelerator.is_main_process:
+        logger.info("GPU memory monitoring enabled (every 50 steps)")
+
     # 训练主循环
     for epoch in range(first_epoch, config.num_train_epochs):
         model.train()
         train_loss = 0.0
         
         for step, batch in enumerate(train_dataloader):
+            # 打印第一个batch的信息（仅一次）
+            if global_step == 0 and step == 0 and accelerator.is_main_process:
+                logger.info(f"First batch shape: {batch.shape}")
+            
             with accelerator.accumulate(model):
-                # 数据预处理 - 明确转换到正确的设备和类型
-                frames = batch.float() / 255.0  # N,T,C,H,W, [0,1]
+                # 数据预处理 - MiniDataset已归一化到[0,1]
+                frames = batch.float()  # N,T,C,H,W, [0,1] - no need to divide by 255
                 # 转换到与模型参数相同的类型（bf16）
                 frames = frames.to(accelerator.device, dtype=torch.bfloat16)
                 
@@ -611,19 +837,162 @@ def main():
                 
                 # 定期内存管理和通信优化（每100步）
                 if global_step % 100 == 0:
-                    torch.cuda.empty_cache()  # 清理GPU内存碎片
+                    torch.cuda.empty_cache()
                     if hasattr(accelerator.state, 'deepspeed_plugin') and accelerator.state.deepspeed_plugin is not None:
-                        # DeepSpeed环境下的额外清理
                         import gc
-                        gc.collect()  # Python垃圾回收
-                        logger.info(f"Step {global_step}: Memory cleanup completed")
+                        gc.collect()
                 
-                # 内存监控（每50步）
+                # 内存监控（每50步，静默执行）
                 if global_step % 50 == 0:
                     if torch.cuda.is_available():
-                        memory_allocated = torch.cuda.memory_allocated() / 1024**3  # GB
-                        memory_reserved = torch.cuda.memory_reserved() / 1024**3   # GB
-                        logger.info(f"Step {global_step}: GPU Memory - Allocated: {memory_allocated:.2f}GB, Reserved: {memory_reserved:.2f}GB")
+                        memory_allocated = torch.cuda.memory_allocated() / 1024**3
+                        memory_reserved = torch.cuda.memory_reserved() / 1024**3
+                        # 仅在内存异常时打印（超过35GB reserved）
+                        if memory_reserved > 35.0:
+                            logger.warning(f"Step {global_step}: High GPU memory usage - Reserved: {memory_reserved:.2f}GB")
+
+                # ============================================================
+                # 验证步骤（每validation_steps执行一次）
+                # ============================================================
+                if global_step % config.validation_steps == 0 and global_step > 0:
+                    logger.info(f"🔍 Running validation at step {global_step}")
+                    
+                    # 同步所有进程
+                    accelerator.wait_for_everyone()
+                    
+                    # 只在主进程运行验证（避免重复计算）
+                    if accelerator.is_main_process:
+                        try:
+                            # 计算验证指标
+                            val_metrics = compute_validation_metrics(
+                                model=accelerator.unwrap_model(model),
+                                val_dataloader=val_dataloader,
+                                device=accelerator.device,
+                                lpips_fn=lpips_fn,
+                                num_samples=config.num_validation_samples,
+                                logger=logger,
+                                use_amp=(accelerator.mixed_precision != "no")
+                            )
+                            
+                            # 记录到TensorBoard
+                            accelerator.log(val_metrics, step=global_step)
+                            
+                            # 保存到历史记录
+                            validation_history['steps'].append(global_step)
+                            validation_history['psnr'].append(val_metrics['val/psnr'])
+                            validation_history['ssim'].append(val_metrics['val/ssim'])
+                            if 'val/lpips' in val_metrics:
+                                validation_history['lpips'].append(val_metrics['val/lpips'])
+                            
+                            # 打印验证结果
+                            logger.info(f"✅ Validation Results (Step {global_step}):")
+                            logger.info(f"   PSNR:  {val_metrics['val/psnr']:.2f} ± {val_metrics['val/psnr_std']:.2f} dB")
+                            logger.info(f"   SSIM:  {val_metrics['val/ssim']:.4f}")
+                            if 'val/lpips' in val_metrics:
+                                logger.info(f"   LPIPS: {val_metrics['val/lpips']:.4f}")
+                            
+                            # ============================================================
+                            # 最佳模型保存逻辑
+                            # ============================================================
+                            current_psnr = val_metrics['val/psnr']
+                            
+                            if current_psnr > best_val_psnr:
+                                # 发现新的最佳模型
+                                improvement = current_psnr - best_val_psnr
+                                best_val_psnr = current_psnr
+                                best_val_step = global_step
+                                patience_counter = 0  # 重置早停计数器
+                                
+                                logger.info(f"🏆 New Best Model! PSNR improved by {improvement:.2f} dB")
+                                logger.info(f"   Best PSNR: {best_val_psnr:.2f} dB at step {best_val_step}")
+                                
+                                # 保存最佳模型
+                                best_model_dir = os.path.join(config.output_dir, "best_model")
+                                
+                                # 删除旧的最佳模型
+                                if os.path.exists(best_model_dir):
+                                    shutil.rmtree(best_model_dir)
+                                    logger.info(f"   Removed old best model")
+                                
+                                # 保存新的最佳模型
+                                os.makedirs(best_model_dir, exist_ok=True)
+                                
+                                # 1. 保存模型权重
+                                model_to_save = accelerator.unwrap_model(model)
+                                torch.save(
+                                    model_to_save.state_dict(),
+                                    os.path.join(best_model_dir, "model.pth")
+                                )
+                                
+                                # 2. 保存元信息
+                                best_model_info = {
+                                    'step': global_step,
+                                    'psnr': float(current_psnr),
+                                    'ssim': float(val_metrics['val/ssim']),
+                                    'train_loss': float(total_loss.detach().item()) if 'total_loss' in locals() else 0.0,
+                                    'timestamp': datetime.datetime.now().isoformat(),
+                                }
+                                if 'val/lpips' in val_metrics:
+                                    best_model_info['lpips'] = float(val_metrics['val/lpips'])
+                                
+                                with open(os.path.join(best_model_dir, "model_info.json"), 'w') as f:
+                                    json.dump(best_model_info, f, indent=2)
+                                
+                                logger.info(f"   ✅ Saved best model to {best_model_dir}")
+                                
+                            else:
+                                # 没有改善
+                                patience_counter += 1
+                                logger.info(f"⚠️  No improvement for {patience_counter} validation(s)")
+                                logger.info(f"   Current PSNR: {current_psnr:.2f} dB")
+                                logger.info(f"   Best PSNR: {best_val_psnr:.2f} dB (at step {best_val_step})")
+                                
+                                # ============================================================
+                                # 早停检查
+                                # ============================================================
+                                if patience_counter >= patience_limit:
+                                    logger.info(f"🛑 Early Stopping Triggered!")
+                                    logger.info(f"   No improvement for {patience_limit} validations ({patience_limit * config.validation_steps} steps)")
+                                    logger.info(f"   Best model: step {best_val_step}, PSNR {best_val_psnr:.2f} dB")
+                                    
+                                    # 保存早停信息
+                                    early_stop_info = {
+                                        'stopped_at_step': global_step,
+                                        'best_step': best_val_step,
+                                        'best_psnr': float(best_val_psnr),
+                                        'patience_limit': patience_limit,
+                                        'reason': 'early_stopping'
+                                    }
+                                    
+                                    with open(os.path.join(config.output_dir, "early_stop_info.json"), 'w') as f:
+                                        json.dump(early_stop_info, f, indent=2)
+                                    
+                                    logger.info("   Exiting training loop...")
+                                    # 设置标志，外层循环检查后退出
+                                    should_stop_training = True
+                            
+                            # 定期保存验证历史
+                            if global_step % (config.validation_steps * 5) == 0:
+                                validation_history_path = os.path.join(config.output_dir, "validation_history.json")
+                                with open(validation_history_path, 'w') as f:
+                                    json.dump(validation_history, f, indent=2)
+                                logger.info(f"   Saved validation history to {validation_history_path}")
+                            
+                        except Exception as e:
+                            logger.error(f"❌ Validation failed: {e}")
+                            import traceback
+                            traceback.print_exc()
+                    
+                    # 同步所有进程（等待主进程完成验证）
+                    accelerator.wait_for_everyone()
+                    
+                    # 清理显存
+                    torch.cuda.empty_cache()
+                    
+                    # 检查是否应该早停
+                    if 'should_stop_training' in locals() and should_stop_training:
+                        logger.info("Early stopping: breaking out of training loop")
+                        break  # 退出训练循环
 
                 # 保存检查点
                 if global_step % config.checkpointing_steps == 0:

@@ -72,6 +72,13 @@ runs/
 # Training outputs
 output/
 logs/
+inference_results/
+diagnosis_results/
+evaluation_results/
+check_results/
+inference_output/
+visualizations/
+evaluate/
 
 # Large data directories
 CogVideoX-2b/
